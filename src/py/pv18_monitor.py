@@ -12,6 +12,10 @@ with paho-mqtt under the "PV18" prefix (configurable via --mqtt-prefix):
   PV18/inverter/...      individual values (JSON, retained), e.g.
   PV18/battery/voltage       PV18/pv/power      PV18/errors
 
+The display carries a status bar at the bottom: application version (HEAD
+commit date as YYTMMDDHHMM) and short commit hash ("*" if the working tree
+is dirty), plus the active settings (port, slave, baud, interval, MQTT).
+
 Hardware quirks handled (see PV1800 class):
   * the inverter answers only the first request after the port is opened,
     so every request uses a freshly opened port;
@@ -46,7 +50,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
 import time
 
@@ -767,6 +773,69 @@ class MqttPublisher:
 
 
 # ---------------------------------------------------------------------------
+# Status bar (bottom of the TUI)
+# ---------------------------------------------------------------------------
+
+def git_version(path: str) -> str:
+    """Version string for the git checkout containing *path*:
+
+    "<commit date as YYTMMDDHHMM> (<short hash>)" — e.g. "26T08280725 (c159076)".
+    A trailing "*" on the hash marks uncommitted changes.  Returns
+    "unknown" when the file is not inside a git repository.
+    """
+    d = os.path.dirname(os.path.abspath(path))
+    try:
+        r = subprocess.run(
+            ["git", "-C", d, "log", "-1",
+             "--date=format:%yT%m%d%H%M", "--format=%cd|%h"],
+            capture_output=True, text=True, timeout=2, check=True)
+        date, h = r.stdout.strip().split("|")
+        s = subprocess.run(["git", "-C", d, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=2,
+                           check=True)
+        if s.stdout.strip():
+            h += "*"
+        return f"{date} ({h})"
+    except Exception:
+        return "unknown"
+
+
+def status_bar(version: str, args) -> str:
+    """One-line version/settings bar, truncated to the terminal width."""
+    parts = [f"PV18 {version}",
+             f"{args.port} slave {args.slave} {args.baud}"]
+    if args.watch:
+        parts.append(f"interval {args.interval:.1f}s")
+    else:
+        parts.append("snapshot")
+    if args.mqtt_host:
+        mqtt = f"mqtt {args.mqtt_host}:{args.mqtt_port}"
+        if args.mqtt_prefix != "PV18":
+            mqtt += f" [{args.mqtt_prefix}]"
+        parts.append(mqtt)
+    else:
+        parts.append("mqtt off")
+    body = " │ ".join(parts)
+    width = shutil.get_terminal_size().columns
+    bar = "── " + body
+    room = width - len(bar)
+    if room < 0:
+        return bar[:width]
+    if room <= 2:
+        return bar
+    return bar + "─" * (room - 2) + "──"
+
+
+def frame_with_bar(text: str, bar: str, height: int) -> str:
+    """Pad *text* with blank lines so *bar* lands on the last terminal row."""
+    lines = text.rstrip("\n").split("\n")
+    blank = height - len(lines) - 1
+    if blank < 0:
+        blank = 0
+    return "\n".join(lines + [""] * blank + [bar])
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -816,6 +885,19 @@ def main() -> int:
                   file=sys.stderr)
             mqtt = None
     is_tty = sys.stdout.isatty()
+    version = git_version(__file__)
+
+    def show(text: str) -> None:
+        """Print a report frame; in TTY watch mode the status bar (version,
+        commit hash, settings) is pinned to the bottom row."""
+        if is_tty and args.watch:
+            height = shutil.get_terminal_size().lines
+            sys.stdout.write("\x1b[2J\x1b[H" +
+                             frame_with_bar(text, status_bar(version, args),
+                                            height) + "\n")
+        else:
+            print(text)
+            print(status_bar(version, args))
     # Last correctly received values — kept across cycles in --watch mode.
     regs: dict[int, int] = {}
     last_good: str | None = None
@@ -848,15 +930,12 @@ def main() -> int:
                         for name, err in errors.items())
                 if mqtt is not None:
                     mqtt.publish_snapshot(regs)
-                if is_tty and args.watch:
-                    sys.stdout.write("\x1b[2J\x1b[H" + last_good + "\n")
-                else:
-                    print(last_good)
+                show(last_good)
             except ModbusError as e:
                 if args.watch:
                     msg = f"  !! communication error: {e} (keeping last snapshot)"
                     if last_good is not None:
-                        sys.stdout.write("\x1b[2J\x1b[H" + last_good + "\n" + msg + "\n")
+                        show(last_good + "\n" + msg)
                     else:
                         print(msg)
                 elif passes + 1 >= args.snapshot_passes:
