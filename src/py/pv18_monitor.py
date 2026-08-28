@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""pv1800_monitor.py — MustPower PV1800 (SP1800, "18-series") status monitor.
+"""pv18_monitor.py — MustPower PV1800 (SP1800, "18-series") status monitor.
 
 Reads the inverter over RS-485 Modbus RTU (FC 0x03) and prints a decoded
 status to the terminal. Uses pyserial for the serial port; the Modbus RTU
 layer (frames, CRC) is implemented here — no pymodbus.
+
+MQTT (optional, --mqtt-host): each successfully read snapshot is published
+with paho-mqtt under the "PV18" prefix (configurable via --mqtt-prefix):
+  PV18/status            full decoded snapshot (JSON)
+  PV18/online            true/false (retained, last will set on disconnect)
+  PV18/inverter/...      individual values (JSON, retained), e.g.
+  PV18/battery/voltage       PV18/pv/power      PV18/errors
 
 Hardware quirks handled (see PV1800 class):
   * the inverter answers only the first request after the port is opened,
@@ -17,7 +24,8 @@ Hardware quirks handled (see PV1800 class):
 In --watch mode the last correctly received values are kept across cycles:
 registers that fail to read keep their previous values, and every block
 that has not been read successfully yet is re-read on the following cycles
-until it succeeds.
+until it succeeds.  In single-shot mode failed blocks are re-read for up
+--snapshot-passes passes before giving up.
 
 Protocol reference: doc/PV1800_protocol.md
   * RS-485, 19200 baud, 8 data bits, no parity, 1 stop bit
@@ -27,14 +35,17 @@ Protocol reference: doc/PV1800_protocol.md
     settings, 25201(79) inverter status
 
 Usage:
-    python3 pv1800_monitor.py                  # single snapshot
-    python3 pv1800_monitor.py --watch          # refresh every 2 s
-    python3 pv1800_monitor.py --port /dev/ttyUSB1 --slave 4
+    python3 pv18_monitor.py                  # single snapshot
+    python3 pv18_monitor.py --watch          # refresh every 2 s
+    python3 pv18_monitor.py --port /dev/ttyUSB1 --slave 4
+    python3 pv18_monitor.py --watch --mqtt-host 192.168.1.10
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import struct
 import sys
 import time
@@ -537,6 +548,225 @@ def render(regs: dict[int, int]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MQTT publishing (optional, paho-mqtt)
+# ---------------------------------------------------------------------------
+
+def build_status(regs: dict[int, int]) -> dict:
+    """Decode registers into a JSON-serializable status dict."""
+    def g(key):
+        return regs.get(A[key])
+
+    def s(key, scale: float = 1.0):
+        v = regs.get(A[key])
+        return None if v is None else v * scale
+
+    def ss(key, scale: float = 1.0):
+        v = regs.get(A[key])
+        if v is None:
+            return None
+        if v >= 32768:
+            v -= 65536
+        return v * scale
+
+    def state(key, table):
+        v = g(key)
+        return None if v is None else table.get(v, f"unknown({v})")
+
+    def onoff(key):
+        v = g(key)
+        return None if v is None else bool(v)
+
+    batt_i = ss("batt_i")
+    if batt_i is None:
+        batt_dir = None
+    elif batt_i > 0:
+        batt_dir = "discharge"
+    elif batt_i < 0:
+        batt_dir = "charge"
+    else:
+        batt_dir = "idle"
+
+    def bit_list(pairs):
+        out = []
+        for label, key, table in pairs:
+            v = g(key)
+            for bit in range(16):
+                if v and (v >> bit) & 1:
+                    name = table[bit] if bit < len(table) and table[bit] \
+                        else f"bit {bit} (undefined)"
+                    out.append(f"{label}: {name}")
+        return out
+
+    return {
+        "model": model_name(regs),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "firmware": {
+            "hardware": fmt_edition(g("hw")) if g("hw") is not None else None,
+            "software": fmt_edition(g("sw")) if g("sw") is not None else None,
+            "protocol": fmt_edition(g("proto")) if g("proto") is not None else None,
+        },
+        "inverter": {
+            "work_state": state("work", WORK_STATE),
+            "voltage": s("inv_v", 0.1),
+            "frequency": s("f_inv", 0.01),
+            "power": s("p_inv"),
+            "apparent_power": s("s_inv"),
+            "load_percent": g("load_pct"),
+            "bus_voltage": s("bus_v", 0.1),
+            "temperature_ac": g("t_ac"),
+            "temperature_dc": g("t_dc"),
+            "relay_inverter": onoff("r_inv"),
+            "relay_grid": onoff("r_grid"),
+            "relay_load": onoff("r_load"),
+            "relay_n_line": onoff("r_n"),
+            "relay_dc": onoff("r_dc"),
+            "relay_earth": onoff("r_earth"),
+        },
+        "grid": {
+            "voltage": s("grid_v", 0.1),
+            "frequency": s("f_grid", 0.01),
+            "power": ss("p_grid"),
+            "apparent_power": ss("s_grid"),
+        },
+        "battery": {
+            "voltage": s("batt_v", 0.1),
+            "current": batt_i,
+            "direction": batt_dir,
+            "power": s("batt_p"),
+            "class": g("batt_class"),
+        },
+        "charger": {
+            "work_state": state("c_work", CHR_WORK),
+            "mppt_state": state("c_mppt", MPPT_STATE),
+            "charging_state": state("c_charge", CHARGE_STATE),
+            "battery_voltage": s("c_batt_v", 0.1),
+            "current": s("c_i", 0.1),
+            "temperature": g("c_t"),
+            "relay_battery": onoff("c_r_batt"),
+            "relay_pv": onoff("c_r_pv"),
+        },
+        "pv": {
+            "voltage": s("pv_v", 0.1),
+            "current": s("c_i", 0.1),
+            "power": s("c_p"),
+        },
+        "energy_kwh": {
+            "pv": energy_kwh(regs, 15217, 15218),
+            "grid_charge": energy_kwh(regs, 25245, 25246),
+            "battery_discharge": energy_kwh(regs, 25247, 25248),
+            "grid_buy": energy_kwh(regs, 25249, 25250),
+            "grid_sell": energy_kwh(regs, 25251, 25252),
+            "load": energy_kwh(regs, 25253, 25254),
+            "self_use": energy_kwh(regs, 25255, 25256),
+            "pv_sell": energy_kwh(regs, 25257, 25258),
+        },
+        "errors": bit_list((
+            ("inverter", "err1", INV_ERR1),
+            ("inverter", "err2", INV_ERR2),
+            ("charger", "c_err", CHR_ERR1))),
+        "warnings": bit_list((
+            ("inverter", "warn1", INV_WARN1),
+            ("charger", "c_warn", CHR_WARN1))),
+    }
+
+
+# Individual topics published alongside PV18/status (relative to the prefix).
+MQTT_TOPICS = (
+    ("inverter/work_state", lambda st: st["inverter"]["work_state"]),
+    ("inverter/voltage", lambda st: st["inverter"]["voltage"]),
+    ("inverter/frequency", lambda st: st["inverter"]["frequency"]),
+    ("inverter/power", lambda st: st["inverter"]["power"]),
+    ("bus/voltage", lambda st: st["inverter"]["bus_voltage"]),
+    ("grid/voltage", lambda st: st["grid"]["voltage"]),
+    ("grid/frequency", lambda st: st["grid"]["frequency"]),
+    ("grid/power", lambda st: st["grid"]["power"]),
+    ("battery/voltage", lambda st: st["battery"]["voltage"]),
+    ("battery/current", lambda st: st["battery"]["current"]),
+    ("battery/power", lambda st: st["battery"]["power"]),
+    ("battery/energy_discharged", lambda st: st["energy_kwh"]["battery_discharge"]),
+    ("pv/voltage", lambda st: st["pv"]["voltage"]),
+    ("pv/current", lambda st: st["pv"]["current"]),
+    ("pv/power", lambda st: st["pv"]["power"]),
+    ("pv/energy", lambda st: st["energy_kwh"]["pv"]),
+    ("charger/state", lambda st: st["charger"]["work_state"]),
+    ("charger/mppt", lambda st: st["charger"]["mppt_state"]),
+    ("charger/temperature", lambda st: st["charger"]["temperature"]),
+    ("relay/inverter", lambda st: st["inverter"]["relay_inverter"]),
+    ("relay/grid", lambda st: st["inverter"]["relay_grid"]),
+    ("relay/load", lambda st: st["inverter"]["relay_load"]),
+    ("errors", lambda st: st["errors"]),
+    ("warnings", lambda st: st["warnings"]),
+)
+
+
+class MqttPublisher:
+    """Publishes decoded snapshots to an MQTT broker under a topic prefix.
+
+    Uses paho-mqtt's threaded client: publishing is non-blocking, and the
+    client reconnects automatically (exponential delay 1-60 s) if the
+    broker goes away.  All messages are retained so late subscribers
+    immediately receive the last known state.
+    """
+
+    def __init__(self, host: str, port: int, prefix: str,
+                 user: str | None = None, password: str | None = None,
+                 keepalive: int = 60):
+        import paho.mqtt.client as pmqtt
+        import warnings
+
+        client_id = f"pv18-monitor-{os.getpid()}"
+        # The VERSION1 callback API works on paho-mqtt 1.x and 2.x alike;
+        # 2.x only emits a deprecation warning for it.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            if hasattr(pmqtt, "CallbackAPIVersion"):  # paho-mqtt >= 2.0
+                self.client = pmqtt.Client(
+                    client_id=client_id,
+                    callback_api_version=pmqtt.CallbackAPIVersion.VERSION1)
+            else:                                     # paho-mqtt 1.x
+                self.client = pmqtt.Client(client_id=client_id)
+        if user:
+            self.client.username_pw_set(user, password)
+        self.prefix = prefix
+        self.client.will_set(f"{prefix}/online", json.dumps(False),
+                             qos=1, retain=True)
+        self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
+        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        self.client.connect(host, port, keepalive=keepalive)
+        self.client.loop_start()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            client.publish(f"{self.prefix}/online", json.dumps(True),
+                           qos=1, retain=True)
+        else:
+            print(f"mqtt: broker connection failed (rc={rc}), "
+                  f"will keep retrying", file=sys.stderr)
+
+    def _on_disconnect(self, client, userdata, rc):
+        if rc != 0:
+            print(f"mqtt: lost broker connection (rc={rc}), "
+                  f"will keep retrying", file=sys.stderr)
+
+    def publish_snapshot(self, regs: dict[int, int]):
+        """Publish PV18/status plus the individual topics."""
+        status = build_status(regs)
+        self.client.publish(f"{self.prefix}/status",
+                            json.dumps(status), qos=1, retain=True)
+        for topic, getter in MQTT_TOPICS:
+            self.client.publish(f"{self.prefix}/{topic}",
+                                json.dumps(getter(status)), qos=1, retain=True)
+
+    def close(self):
+        try:
+            self.client.loop_stop()
+            self.client.disconnect()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -555,18 +785,44 @@ def main() -> int:
                     help="refresh interval in seconds for --watch (default 2.0)")
     ap.add_argument("--retries", type=int, default=3,
                     help="attempts per register block (default 3)")
+    ap.add_argument("--snapshot-passes", type=int, default=3,
+                    help="single-shot: max read passes until all blocks "
+                         "have been read (default 3)")
+    ap.add_argument("--mqtt-host", default=None,
+                    help="MQTT broker host; enables MQTT publishing "
+                         "(default: disabled)")
+    ap.add_argument("--mqtt-port", type=int, default=1883,
+                    help="MQTT broker port (default 1883)")
+    ap.add_argument("--mqtt-user", default=None,
+                    help="MQTT username (optional)")
+    ap.add_argument("--mqtt-password", default=None,
+                    help="MQTT password (optional)")
+    ap.add_argument("--mqtt-prefix", default="PV18",
+                    help="MQTT topic prefix (default PV18)")
     ap.add_argument("--watch", action="store_true",
                     help="refresh continuously instead of a single snapshot")
     args = ap.parse_args()
 
     pv = PV1800(args.port, args.baud, args.slave, timeout=args.timeout,
                 retries=args.retries)
+    mqtt = None
+    if args.mqtt_host:
+        try:
+            mqtt = MqttPublisher(args.mqtt_host, args.mqtt_port,
+                                 args.mqtt_prefix, user=args.mqtt_user,
+                                 password=args.mqtt_password)
+        except Exception as e:  # broker unreachable, bad import, ...
+            print(f"warning: mqtt: {e} (continuing without MQTT)",
+                  file=sys.stderr)
+            mqtt = None
     is_tty = sys.stdout.isatty()
     # Last correctly received values — kept across cycles in --watch mode.
     regs: dict[int, int] = {}
     last_good: str | None = None
-    # Blocks not yet read successfully; re-read on every watch cycle.
+    # Blocks not yet read successfully; re-read on every cycle (watch: until
+    # success, single-shot: until all read or --snapshot-passes exhausted).
     pending: set[str] = {name for name, _s, _c in BLOCKS}
+    passes = 0
     exit_code = 0
 
     try:
@@ -575,12 +831,11 @@ def main() -> int:
                 if args.watch:
                     blocks = watch_cycle_blocks(pending)
                 else:
-                    blocks = list(BLOCKS)
+                    blocks = [b for b in BLOCKS if b[0] in pending]
                 new, errors = read_blocks(pv, blocks)
-                if args.watch:
-                    for name, _s, _c in blocks:
-                        if name not in errors:
-                            pending.discard(name)
+                for name, _s, _c in blocks:
+                    if name not in errors:
+                        pending.discard(name)
                 if not new:
                     raise ModbusError(
                         "; ".join(f"{k}: {v}" for k, v in errors.items())
@@ -591,28 +846,39 @@ def main() -> int:
                     last_good += "\n" + "\n".join(
                         f"  !! {name} read failed (stale value kept): {err}"
                         for name, err in errors.items())
+                if mqtt is not None:
+                    mqtt.publish_snapshot(regs)
                 if is_tty and args.watch:
                     sys.stdout.write("\x1b[2J\x1b[H" + last_good + "\n")
                 else:
                     print(last_good)
             except ModbusError as e:
-                if not args.watch:
+                if args.watch:
+                    msg = f"  !! communication error: {e} (keeping last snapshot)"
+                    if last_good is not None:
+                        sys.stdout.write("\x1b[2J\x1b[H" + last_good + "\n" + msg + "\n")
+                    else:
+                        print(msg)
+                elif passes + 1 >= args.snapshot_passes:
                     print(f"error: {e}", file=sys.stderr)
                     return 1
-                msg = f"  !! communication error: {e} (keeping last snapshot)"
-                if last_good is not None:
-                    sys.stdout.write("\x1b[2J\x1b[H" + last_good + "\n" + msg + "\n")
-                else:
-                    print(msg)
+                # else: single-shot, pass budget left — retry below
             sys.stdout.flush()
             if not args.watch:
-                break
-            try:
-                time.sleep(args.interval)
-            except KeyboardInterrupt:
-                break
+                passes += 1
+                if not pending or passes >= args.snapshot_passes:
+                    break
+                time.sleep(1.0)  # let the inverter recover between passes
+            else:
+                try:
+                    time.sleep(args.interval)
+                except KeyboardInterrupt:
+                    break
     except KeyboardInterrupt:
         pass
+    finally:
+        if mqtt is not None:
+            mqtt.close()
     return exit_code
 
 
