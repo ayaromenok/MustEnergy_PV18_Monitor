@@ -14,6 +14,11 @@ Hardware quirks handled (see PV1800 class):
   * the device drops the last register of each block (byte count field
     still says the full count); the parser accepts the shorter frame.
 
+In --watch mode the last correctly received values are kept across cycles:
+registers that fail to read keep their previous values, and every block
+that has not been read successfully yet is re-read on the following cycles
+until it succeeds.
+
 Protocol reference: doc/PV1800_protocol.md
   * RS-485, 19200 baud, 8 data bits, no parity, 1 stop bit
   * Modbus slave address 4
@@ -322,16 +327,15 @@ class PV1800:
 STATUS_BLOCKS = (("charger_st", 15201, 21), ("inv_st", 25201, 79))
 
 
-def read_all(pv: PV1800, full: bool = True,
-             pause: float = 0.5) -> tuple[dict[int, int], dict[str, str]]:
-    """Read blocks, return ({absolute register address: value}, {block: error}).
+def read_blocks(pv: PV1800, blocks,
+                pause: float = 0.5) -> tuple[dict[int, int], dict[str, str]]:
+    """Read the given blocks.
 
-    full=True reads all six blocks (identification + settings + status);
-    full=False reads only the two status blocks.  A block that fails after
-    all retries is reported in the error dict; the other blocks are still
-    read (the inverter only answers sporadically — see PV1800 docstring).
+    Returns ({absolute register address: value}, {block name: error}).
+    A block that fails after all retries is reported in the error dict; the
+    other blocks are still read (the inverter only answers sporadically —
+    see PV1800 docstring).
     """
-    blocks = BLOCKS if full else STATUS_BLOCKS
     regs: dict[int, int] = {}
     errors: dict[str, str] = {}
     for i, (_name, start, count) in enumerate(blocks):
@@ -343,6 +347,14 @@ def read_all(pv: PV1800, full: bool = True,
         except ModbusError as e:
             errors[_name] = str(e)
     return regs, errors
+
+
+def watch_cycle_blocks(pending: set[str]) -> list:
+    """Blocks to read on a watch cycle: the two alwaysRead status blocks
+    plus every block not yet read successfully (so the first cycle reads
+    all six, as the reference monitor does — doc §5)."""
+    names = {name for name, _s, _c in STATUS_BLOCKS} | pending
+    return [b for b in BLOCKS if b[0] in names]
 
 
 def fmt_edition(n: int) -> str:
@@ -550,18 +562,25 @@ def main() -> int:
     pv = PV1800(args.port, args.baud, args.slave, timeout=args.timeout,
                 retries=args.retries)
     is_tty = sys.stdout.isatty()
+    # Last correctly received values — kept across cycles in --watch mode.
     regs: dict[int, int] = {}
     last_good: str | None = None
-    first_cycle = True
+    # Blocks not yet read successfully; re-read on every watch cycle.
+    pending: set[str] = {name for name, _s, _c in BLOCKS}
     exit_code = 0
 
     try:
         while True:
             try:
-                # First cycle: full read (id + settings + status).  Later
-                # watch cycles refresh only the two status blocks, as the
-                # reference monitor does (doc §5).
-                new, errors = read_all(pv, full=first_cycle)
+                if args.watch:
+                    blocks = watch_cycle_blocks(pending)
+                else:
+                    blocks = list(BLOCKS)
+                new, errors = read_blocks(pv, blocks)
+                if args.watch:
+                    for name, _s, _c in blocks:
+                        if name not in errors:
+                            pending.discard(name)
                 if not new:
                     raise ModbusError(
                         "; ".join(f"{k}: {v}" for k, v in errors.items())
@@ -586,7 +605,6 @@ def main() -> int:
                 else:
                     print(msg)
             sys.stdout.flush()
-            first_cycle = False
             if not args.watch:
                 break
             try:
