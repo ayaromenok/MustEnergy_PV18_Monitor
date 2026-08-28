@@ -1,0 +1,8 @@
+[Unit]
+Description=Solar Invenrtor PV18 service
+
+[Service]
+ExecStart=python /home/pi/projects/MustEnergy_PV18_Monitor/src/py/pv18_monitor.py --watch --mqtt-host 192.168.1.101
+
+[Install]
+WantedBy=multi-user.target
