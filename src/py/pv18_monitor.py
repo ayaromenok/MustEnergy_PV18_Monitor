@@ -574,6 +574,10 @@ def build_status(regs: dict[int, int]) -> dict:
             v -= 65536
         return v * scale
 
+    def rnd(v, n: int):
+        """Round for MQTT payloads (None stays None)."""
+        return None if v is None else round(v, n)
+
     def state(key, table):
         v = g(key)
         return None if v is None else table.get(v, f"unknown({v})")
@@ -629,7 +633,7 @@ def build_status(regs: dict[int, int]) -> dict:
             "relay_earth": onoff("r_earth"),
         },
         "grid": {
-            "voltage": s("grid_v", 0.1),
+            "voltage": rnd(s("grid_v", 0.1), 1),
             "frequency": s("f_grid", 0.01),
             "power": ss("p_grid"),
             "apparent_power": ss("s_grid"),
@@ -659,7 +663,7 @@ def build_status(regs: dict[int, int]) -> dict:
         "energy_kwh": {
             "pv": energy_kwh(regs, 15217, 15218),
             "grid_charge": energy_kwh(regs, 25245, 25246),
-            "battery_discharge": energy_kwh(regs, 25247, 25248),
+            "battery_discharge": rnd(energy_kwh(regs, 25247, 25248), 3),
             "grid_buy": energy_kwh(regs, 25249, 25250),
             "grid_sell": energy_kwh(regs, 25251, 25252),
             "load": energy_kwh(regs, 25253, 25254),
