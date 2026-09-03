@@ -1,0 +1,17 @@
+type: entities
+entities:
+  - entity: sensor.pv18_inverter_work_state
+  - entity: sensor.pv18_inverter_voltage
+  - entity: sensor.pv18_inverter_frequency
+  - entity: sensor.pv18_inverter_power
+  - entity: sensor.pv18_grid_voltage
+  - entity: sensor.pv18_grid_frequency
+  - entity: sensor.pv18_grid_power
+  - entity: sensor.pv18_battery_voltage
+  - entity: sensor.pv18_battery_current
+  - entity: sensor.pv18_battery_power
+  - entity: sensor.pv18_battery_energy_out
+  - entity: sensor.pv18_bus_voltage
+  - entity: sensor.pv18_pv_energy
+  - entity: sensor.pv18_pv_current
+  - entity: sensor.pv18_pv_voltage
