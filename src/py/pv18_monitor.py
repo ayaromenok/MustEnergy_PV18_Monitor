@@ -43,7 +43,7 @@ Protocol reference: doc/PV1800_protocol.md
 
 Usage:
     python3 pv18_monitor.py                  # single snapshot
-    python3 pv18_monitor.py --watch          # refresh every 2 s
+    python3 pv18_monitor.py --watch          # refresh every 10 s
     python3 pv18_monitor.py --port /dev/ttyUSB1 --slave 4
     python3 pv18_monitor.py --watch --mqtt-host 192.168.1.10
 """
@@ -689,24 +689,45 @@ MQTT_TOPICS = (
     ("inverter/voltage", lambda st: st["inverter"]["voltage"]),
     ("inverter/frequency", lambda st: st["inverter"]["frequency"]),
     ("inverter/power", lambda st: st["inverter"]["power"]),
+    ("inverter/apparent_power", lambda st: st["inverter"]["apparent_power"]),
+    ("inverter/load_percent", lambda st: st["inverter"]["load_percent"]),
+    ("inverter/temperature_ac", lambda st: st["inverter"]["temperature_ac"]),
+    ("inverter/temperature_dc", lambda st: st["inverter"]["temperature_dc"]),
     ("bus/voltage", lambda st: st["inverter"]["bus_voltage"]),
     ("grid/voltage", lambda st: st["grid"]["voltage"]),
     ("grid/frequency", lambda st: st["grid"]["frequency"]),
     ("grid/power", lambda st: st["grid"]["power"]),
+    ("grid/apparent_power", lambda st: st["grid"]["apparent_power"]),
     ("battery/voltage", lambda st: st["battery"]["voltage"]),
     ("battery/current", lambda st: st["battery"]["current"]),
+    ("battery/direction", lambda st: st["battery"]["direction"]),
     ("battery/power", lambda st: st["battery"]["power"]),
+    ("battery/class", lambda st: st["battery"]["class"]),
     ("battery/energy_discharged", lambda st: st["energy_kwh"]["battery_discharge"]),
     ("pv/voltage", lambda st: st["pv"]["voltage"]),
     ("pv/current", lambda st: st["pv"]["current"]),
     ("pv/power", lambda st: st["pv"]["power"]),
     ("pv/energy", lambda st: st["energy_kwh"]["pv"]),
+    ("pv/energy_sell", lambda st: st["energy_kwh"]["pv_sell"]),
     ("charger/state", lambda st: st["charger"]["work_state"]),
     ("charger/mppt", lambda st: st["charger"]["mppt_state"]),
+    ("charger/charging_state", lambda st: st["charger"]["charging_state"]),
+    ("charger/battery_voltage", lambda st: st["charger"]["battery_voltage"]),
+    ("charger/current", lambda st: st["charger"]["current"]),
     ("charger/temperature", lambda st: st["charger"]["temperature"]),
+    ("energy/grid_charge", lambda st: st["energy_kwh"]["grid_charge"]),
+    ("energy/grid_buy", lambda st: st["energy_kwh"]["grid_buy"]),
+    ("energy/grid_sell", lambda st: st["energy_kwh"]["grid_sell"]),
+    ("energy/load", lambda st: st["energy_kwh"]["load"]),
+    ("energy/self_use", lambda st: st["energy_kwh"]["self_use"]),
     ("relay/inverter", lambda st: st["inverter"]["relay_inverter"]),
     ("relay/grid", lambda st: st["inverter"]["relay_grid"]),
     ("relay/load", lambda st: st["inverter"]["relay_load"]),
+    ("relay/n_line", lambda st: st["inverter"]["relay_n_line"]),
+    ("relay/dc", lambda st: st["inverter"]["relay_dc"]),
+    ("relay/earth", lambda st: st["inverter"]["relay_earth"]),
+    ("relay/charger_battery", lambda st: st["charger"]["relay_battery"]),
+    ("relay/charger_pv", lambda st: st["charger"]["relay_pv"]),
     ("errors", lambda st: st["errors"]),
     ("warnings", lambda st: st["warnings"]),
 )
@@ -857,8 +878,8 @@ def main() -> int:
                     help=f"Modbus slave address (default {DEFAULT_SLAVE})")
     ap.add_argument("--timeout", type=float, default=0.6,
                     help="response timeout in seconds (default 0.6)")
-    ap.add_argument("--interval", type=float, default=2.0,
-                    help="refresh interval in seconds for --watch (default 2.0)")
+    ap.add_argument("--interval", type=float, default=10.0,
+                    help="refresh interval in seconds for --watch (default 10.0)")
     ap.add_argument("--stale-timeout", type=float, default=None,
                     help="--watch: reset a status block's values to zero if it "
                          "has not been read for this many seconds "
