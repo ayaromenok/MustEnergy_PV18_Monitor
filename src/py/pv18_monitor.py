@@ -28,7 +28,10 @@ Hardware quirks handled (see PV1800 class):
 In --watch mode the last correctly received values are kept across cycles:
 registers that fail to read keep their previous values, and every block
 that has not been read successfully yet is re-read on the following cycles
-until it succeeds.  In single-shot mode failed blocks are re-read for up
+until it succeeds.  A status block that has not been read for
+--stale-timeout seconds (default: 10x the refresh interval, 0 disables)
+is reset to zero, so out-of-date values are not mistaken for live ones.
+In single-shot mode failed blocks are re-read for up
 --snapshot-passes passes before giving up.
 
 Protocol reference: doc/PV1800_protocol.md
@@ -856,6 +859,10 @@ def main() -> int:
                     help="response timeout in seconds (default 0.6)")
     ap.add_argument("--interval", type=float, default=2.0,
                     help="refresh interval in seconds for --watch (default 2.0)")
+    ap.add_argument("--stale-timeout", type=float, default=None,
+                    help="--watch: reset a status block's values to zero if it "
+                         "has not been read for this many seconds "
+                         "(default: 10x --interval; 0 disables)")
     ap.add_argument("--retries", type=int, default=3,
                     help="attempts per register block (default 3)")
     ap.add_argument("--snapshot-passes", type=int, default=3,
@@ -904,15 +911,27 @@ def main() -> int:
             print(status_bar(version, args))
     # Last correctly received values — kept across cycles in --watch mode.
     regs: dict[int, int] = {}
-    last_good: str | None = None
+    # Last successful read time (monotonic) per block — used to detect
+    # out-of-date status blocks in --watch mode.
+    last_ok: dict[str, float] = {}
     # Blocks not yet read successfully; re-read on every cycle (watch: until
     # success, single-shot: until all read or --snapshot-passes exhausted).
     pending: set[str] = {name for name, _s, _c in BLOCKS}
+    stale_timeout = (args.stale_timeout if args.stale_timeout is not None
+                     else 10.0 * args.interval)
     passes = 0
     exit_code = 0
 
     try:
         while True:
+            # Reset out-of-date status values to zero (watch mode only).
+            if args.watch and stale_timeout > 0:
+                now = time.monotonic()
+                for name, start, count in STATUS_BLOCKS:
+                    t = last_ok.get(name)
+                    if t is not None and now - t > stale_timeout:
+                        for addr in range(start, start + count):
+                            regs[addr] = 0
             try:
                 if args.watch:
                     blocks = watch_cycle_blocks(pending)
@@ -922,24 +941,27 @@ def main() -> int:
                 for name, _s, _c in blocks:
                     if name not in errors:
                         pending.discard(name)
+                        last_ok[name] = time.monotonic()
                 if not new:
                     raise ModbusError(
                         "; ".join(f"{k}: {v}" for k, v in errors.items())
                         or f"no response from slave {args.slave}")
                 regs.update(new)
-                last_good = render(regs)
+                out = render(regs)
                 if errors:
-                    last_good += "\n" + "\n".join(
+                    out += "\n" + "\n".join(
                         f"  !! {name} read failed (stale value kept): {err}"
                         for name, err in errors.items())
                 if mqtt is not None:
                     mqtt.publish_snapshot(regs)
-                show(last_good)
+                show(out)
             except ModbusError as e:
                 if args.watch:
-                    msg = f"  !! communication error: {e} (keeping last snapshot)"
-                    if last_good is not None:
-                        show(last_good + "\n" + msg)
+                    msg = f"  !! communication error: {e}"
+                    if regs:
+                        # Re-render: shows zeroed values once the stale
+                        # timeout has expired.
+                        show(render(regs) + "\n" + msg)
                     else:
                         print(msg)
                 elif passes + 1 >= args.snapshot_passes:
