@@ -472,7 +472,7 @@ def render(regs: dict[int, int]) -> str:
         batt_dir = "idle"
     add(f"  Battery:      {_fmt_val(g('batt_v'), 0.1)} V  "
         f"{_fmt_signed(batt_i_s, 1, 0)} A ({batt_dir})  "
-        f"{_fmt_val(g('batt_p'), 1, 0)} W   "
+        f"{_fmt_signed(g('batt_p'), 1, 0)} W   "
         f"({g('batt_class') if g('batt_class') is not None else '--'} V class)")
     add(f"  Temperatures: AC heatsink {g('t_ac') if g('t_ac') is not None else '--'} C, "
         f"DC heatsink {g('t_dc') if g('t_dc') is not None else '--'} C, "
@@ -642,7 +642,7 @@ def build_status(regs: dict[int, int]) -> dict:
             "voltage": rnd(s("batt_v", 0.1), 1),
             "current": rnd(batt_i, 1),
             "direction": batt_dir,
-            "power": rnd(s("batt_p"), 1),
+            "power": rnd(ss("batt_p"), 1),
             "class": g("batt_class"),
         },
         "charger": {
