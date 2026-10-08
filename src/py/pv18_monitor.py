@@ -638,7 +638,7 @@ def build_status(regs: dict[int, int]) -> dict:
         "grid": {
             "voltage": rnd(s("grid_v", 0.1), 1),
             "frequency": rnd(s("f_grid", 0.01), 2),
-            "power": rnd(ss("p_grid"), 1),
+            "power": rnd(ss("p_grid"), 1)*(-1),
             "apparent_power": rnd(ss("s_grid"), 1),
         },
         "battery": {
